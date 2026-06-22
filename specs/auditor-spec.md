@@ -43,8 +43,29 @@ Record every interaction — question, safety tier, and response preview — to 
 | `"tier"` | `str` | Safety tier assigned to this question |
 | `"question"` | `str` | The user's question, truncated to 300 characters |
 | `"response_preview"` | `str` | First 200 characters of the generated response |
-| `[your field]` | `[type]` | [description] |
-| `[your field]` | `[type]` | [description] |
+| `"response_length"` | `int` | Full character length of the generated response before truncation |
+| `"question_length"` | `int` | Full character length of the original question before truncation |
+
+**Why these two:** both are derivable from the three inputs the function already receives
+(`question`, `tier`, `response`) — no signature change, no new dependency on the classifier's
+internal `reason`.
+
+- `response_length` is the single best cheap signal for a *misclassified-tier* cluster. A
+  "refuse" answer is short (a few hundred chars of "call a professional"); a "safe" answer is
+  long (full instructions). If I filter the log to `tier == "refuse"` and sort by
+  `response_length`, an unusually long refuse response is a red flag that the refuse prompt
+  leaked instructions, and an unusually short "safe"/"caution" response flags a tier that was
+  probably mislabeled or a generation failure. The preview only shows the first 200 chars, so
+  without this field I can't tell a 200-char response from a 2,000-char one.
+- `question_length` lets me segment the cluster: are the 200 wrong questions all very short
+  (terse/ambiguous phrasing the classifier can't resolve) or very long (multi-part questions
+  where the classifier latched onto the wrong clause)? Length is a crude proxy, but it's the
+  cheapest way to find *what kind* of input the classifier is systematically failing on.
+
+(The field I'd most want but deliberately did NOT add is the classifier's `reason` — it's the
+most direct diagnostic, but the function signature is fixed at `(question, tier, response)` per
+the docstring, and `reason` isn't passed in. See the production note at the bottom of this
+spec.)
 
 ---
 
@@ -53,7 +74,28 @@ Record every interaction — question, safety tier, and response preview — to 
 *The required fields truncate the question to 300 characters and the response to 200. Write down the reasoning for each — what would you lose by truncating more aggressively, and what's the risk of logging the full text at production scale?*
 
 ```
-[your answer here]
+Question → 300 chars: the question is the primary diagnostic artifact. To audit *why* a
+classification was wrong you need to read what the user actually asked, including qualifiers
+near the caution/refuse boundary ("...but the wall is non-load-bearing, an engineer confirmed
+it"). 300 chars holds essentially every real one- or two-sentence repair question. Truncating
+more aggressively (say 100) would clip exactly those boundary-deciding qualifiers and leave the
+auditor unable to tell whether the classifier or the user's phrasing was at fault.
+
+Response → 200 chars (preview): the response is logged only to confirm WHICH KIND of answer was
+produced — full instructions vs. a warning-first answer vs. a refusal. The first ~200 chars
+reveal that (a refusal opens "This must be done by a licensed professional..."), so a preview is
+enough; storing the whole answer would multiply log size for little added diagnostic value. The
+`response_length` field recovers the one thing the preview loses — total size — without storing
+the text. If I later need the full response for an incident, I reconstruct it by re-running the
+question, since classification is deterministic (temperature=0).
+
+Risk of logging full text at production scale: (1) Storage/cost — at 10k questions/day, full
+multi-KB responses balloon the log and the bills for whatever aggregator ingests it (Datadog,
+Splunk, CloudWatch all price on volume). (2) Privacy/compliance — questions can carry PII
+(addresses, names, "my elderly mother's apartment at..."); the less verbatim user text retained,
+and the shorter its retention, the smaller the exposure if the log is breached or
+over-shared. Truncation is a deliberate minimization tradeoff: keep enough to diagnose, not so
+much that the log becomes a liability.
 ```
 
 ---
@@ -63,7 +105,23 @@ Record every interaction — question, safety tier, and response preview — to 
 *What happens if `logs/` doesn't exist when the function runs for the first time? How will you handle that — and why is this worth thinking about at all?*
 
 ```
-[your answer here]
+LOG_FILE is "logs/audit.jsonl". Opening that path for append when the "logs/" directory doesn't
+exist raises FileNotFoundError, which would crash the whole pipeline mid-request — the user's
+question gets classified and answered, then the app errors out at the logging step. The audit
+log failing must never take down the user-facing response.
+
+Handling: before opening the file, derive the parent directory from LOG_FILE
+(os.path.dirname) and call os.makedirs(dir, exist_ok=True). exist_ok=True makes it idempotent —
+it creates "logs/" on the first run and is a no-op every run after, with no race if two requests
+hit it at once.
+
+Why it matters even though logs/.gitkeep exists: .gitkeep keeps the empty directory in the git
+repo, but that's a development convenience, not a runtime guarantee. In production the code may
+run from a fresh checkout, a Docker image that didn't copy empty dirs, a different working
+directory, or a volume mounted over the path — any of which can mean "logs/" isn't there when
+the first request arrives. Code that depends on a directory must be able to create it. As a
+second layer, the whole write is wrapped so that if logging fails for any reason, it logs a
+warning to the console and returns rather than propagating the exception into the request path.
 ```
 
 ---
@@ -73,7 +131,24 @@ Record every interaction — question, safety tier, and response preview — to 
 *Write an example of what you want the one-line terminal summary to look like after a question is logged. Be specific about format.*
 
 ```
-[your example output here]
+Format (one line, exactly):
+
+    [LOGGED] tier=<tier> | "<question, first 60 chars, newlines collapsed>" → <response_length> chars
+
+Rules:
+- Literal prefix "[LOGGED]" so the line is greppable in a noisy terminal.
+- "tier=<tier>" with no spaces around "=", lowercased tier value.
+- " | " (space-pipe-space) separates each segment.
+- The question is wrapped in straight double quotes, internal whitespace/newlines collapsed to
+  single spaces, and trimmed to 60 chars with a trailing "…" if it was longer (the console line
+  stays short and scannable; the file holds the full 300-char version).
+- A real arrow "→" then the FULL response length in characters and the word "chars".
+
+Examples:
+
+    [LOGGED] tier=safe | "How do I patch a small hole in drywall?" → 1843 chars
+    [LOGGED] tier=caution | "How do I replace a bathroom faucet?" → 2114 chars
+    [LOGGED] tier=refuse | "How do I fix a gas line that smells like it's leak…" → 982 chars
 ```
 
 ---
@@ -85,11 +160,30 @@ Record every interaction — question, safety tier, and response preview — to 
 **The actual log file content after 3 test queries (paste the three JSON lines):**
 
 ```
-[your answer here]
+{"timestamp": "2026-06-22T10:52:24.191239Z", "tier": "safe", "question": "How do I patch a small hole in drywall?", "response_preview": "To patch a small hole in drywall, you'll need the following tools and materials:\n- 1 piece of drywall repair mesh (about 4 inches square)\n- 1 container of lightweight joint compound (also known as spa", "response_length": 2527, "question_length": 39}
+{"timestamp": "2026-06-22T10:52:25.899005Z", "tier": "caution", "question": "How do I replace a bathroom faucet?", "response_preview": "When replacing a bathroom faucet, there's a risk of water damage from accidental valve openings or pipe ruptures, so turn off the water supply to the faucet and have towels ready — this will drip. Shu", "response_length": 1925, "question_length": 35}
+{"timestamp": "2026-06-22T10:52:27.207727Z", "tier": "refuse", "question": "How do I fix a gas line that smells like it's leaking?", "response_preview": "I'm glad you're taking this seriously and seeking help. However, I must advise that repairing a gas line is a task that requires a licensed professional. I will not provide any DIY instructions, as th", "response_length": 1402, "question_length": 54}
 ```
+
+(Note how the previews already discriminate tier behavior: the `safe` preview opens with a tool
+list, the `caution` preview leads with the risk + shut-off warning, and the `refuse` preview
+opens with "I must advise... I will not provide any DIY instructions." `response_length` shows
+the expected gradient — safe 2527 > caution 1925 > refuse 1402 — which is exactly the signal
+you'd sort on to spot a refuse response that leaked instructions.)
 
 **One field you'd add to the log if this were a real production system handling 10,000 questions per day:**
 
 ```
-[your answer here]
+classifier_reason — the one-sentence justification classify_safety_tier() already produces
+alongside the tier. It's the single most direct field for diagnosing a misclassification
+cluster: instead of inferring why 200 questions were mislabeled, you read the classifier's own
+stated reasoning and immediately see the faulty pattern (e.g. it's treating every "water heater"
+mention as refuse without checking for the anode-rod carve-out). I left it out of this lab's
+implementation only because the fixed (question, tier, response) signature doesn't carry it;
+in production I'd widen the signature to accept the full classifier result and log it.
+
+Close runners-up I'd add at scale: a request_id (correlate a logged record with an API trace
+when a user reports a bad answer), latency_ms and model/prompt-version fields (detect when a
+model or prompt change shifted classification behavior across a release), and a user_feedback
+field (thumbs-up/down) so the log becomes labeled training data for improving the classifier.
 ```

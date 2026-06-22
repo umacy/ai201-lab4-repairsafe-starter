@@ -1,34 +1,69 @@
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+
 from config import LOG_FILE
+
+# Truncation limits — see specs/auditor-spec.md "Why these truncation limits?"
+_QUESTION_MAX = 300
+_RESPONSE_PREVIEW_MAX = 200
+_CONSOLE_QUESTION_MAX = 60
+
+
+def _utc_timestamp() -> str:
+    """ISO 8601 UTC timestamp, e.g. 2026-06-22T15:04:05.123456Z."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _console_question(question: str) -> str:
+    """Single-line, 60-char preview of the question for the terminal summary."""
+    collapsed = " ".join(question.split())
+    if len(collapsed) > _CONSOLE_QUESTION_MAX:
+        return collapsed[:_CONSOLE_QUESTION_MAX] + "…"
+    return collapsed
 
 
 def log_interaction(question: str, tier: str, response: str) -> None:
     """
-    Append a structured record of this interaction to the audit log.
+    Append a structured JSON record of this interaction to the audit log.
 
-    TODO — Milestone 3:
+    Writes one JSON object per line to LOG_FILE ("logs/audit.jsonl"). See
+    specs/auditor-spec.md for field choices, truncation rationale, and the
+    console-summary format.
 
-    Before writing any code, complete specs/auditor-spec.md. The key decisions
-    are what fields to log, how much of the question and response to include,
-    and how to handle the logs/ directory not existing yet.
-
-    Each record should be a JSON object written as a single line to LOG_FILE
-    (defined in config.py as "logs/audit.jsonl").
-
-    Required fields:
-      - "timestamp"        : ISO 8601 datetime string
-      - "tier"             : the safety tier assigned to this question
-      - "question"         : the user's question (truncate to 300 chars if longer)
-      - "response_preview" : first 200 characters of the response
-
-    If the logs/ directory doesn't exist, create it before writing.
-
-    Also print a one-line summary to the terminal so you can see logged
-    interactions in real time without opening the file:
-      e.g. [LOGGED] tier=caution | "How do I replace a faucet?" → 47 chars
-
-    Design your log entry in specs/auditor-spec.md before implementing here.
+    Output: None — side effects only (appends to the log file, prints a
+    one-line summary to the terminal). Logging must never crash the request
+    pipeline, so any failure is caught and reported rather than raised.
     """
-    pass
+    record = {
+        "timestamp": _utc_timestamp(),
+        "tier": tier,
+        "question": question[:_QUESTION_MAX],
+        "response_preview": response[:_RESPONSE_PREVIEW_MAX],
+        "response_length": len(response),
+        "question_length": len(question),
+    }
+
+    try:
+        # Create logs/ on first run; no-op (and race-safe) thereafter.
+        log_dir = os.path.dirname(LOG_FILE)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        # Never take down the user-facing response because logging failed.
+        print(f"[LOG ERROR] could not write audit log: {exc.__class__.__name__}: {exc}")
+        return
+
+    summary = (
+        f'[LOGGED] tier={tier} | "{_console_question(question)}" '
+        f"→ {record['response_length']} chars"
+    )
+    try:
+        print(summary)
+    except UnicodeEncodeError:
+        # Some Windows consoles use a legacy code page (cp1252) that can't encode
+        # "→". Don't let a console-encoding quirk crash the request — fall back to ASCII.
+        print(summary.replace("→", "->"))
